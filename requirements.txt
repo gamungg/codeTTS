@@ -1,6 +1,6 @@
-streamlit
-librosa
-numpy
-soundfile
-webrtcvad
-pandas
+streamlit==1.28.0
+librosa==0.10.0
+numpy==1.24.3
+soundfile==0.12.1
+webrtcvad==2.1.0
+pandas==2.0.3
