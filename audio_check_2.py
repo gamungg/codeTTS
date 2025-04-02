@@ -3,12 +3,16 @@ import numpy as np
 import os
 import streamlit as st
 import tempfile
-import soundfile as sf
+import pandas as pd
 import wave
 import struct
-
 from webrtcvad import Vad
-import pandas as pd
+
+# 初始化会话状态
+if 'qc_results' not in st.session_state:
+    st.session_state.qc_results = None
+if 'quality_status' not in st.session_state:
+    st.session_state.quality_status = {}
 
 # GUI 界面
 st.title("🔍 TTS 训练音频质检与标注系统")
@@ -45,9 +49,12 @@ if app_mode == "音频质检":
     snr_threshold = st.slider("信噪比阈值 (dB)", min_value=10, max_value=40, value=15)
     silence_threshold = st.slider("静音比例阈值 (%)", min_value=0, max_value=50, value=20)
 
+    # 噪声段参数
+    noise_start = st.number_input("噪声段起始位置（样本数）", min_value=0, value=0)
+    noise_end = st.number_input("噪声段结束位置（样本数）", min_value=1, value=1000)
 
-    # 以下为检查函数（保持不变）
 
+    # 检查函数
     def check_audio_format(file_path):
         """检查音频格式是否为 MP3 或 WAV"""
         valid_formats = ['.mp3', '.wav']
@@ -55,26 +62,43 @@ if app_mode == "音频质检":
         return file_extension in valid_formats
 
 
-    def check_audio_duration(file_path, min_length=1.0, max_length=10.0):
+    def check_audio_duration(file_path, min_length=1.0, max_length=15.0):
         """检查音频时长是否合理"""
         y, sr = librosa.load(file_path, sr=None)
         duration = librosa.get_duration(y=y, sr=sr)
-        return min_length <= duration <= max_length
+        return min_length <= duration <= max_length, duration
 
 
-    def check_snr(file_path, threshold=15):
+    def calculate_snr_with_ref(audio_path, noise_start=0, noise_end=1000):
+        """通过预留的静音段计算SNR"""
+        y, sr = librosa.load(audio_path, sr=None)
+        if noise_end > len(y):
+            return None, "噪声段超出音频长度"
+
+        noise = y[noise_start:noise_end]  # 提取噪声段
+        signal = y[noise_end:]  # 提取有效语音段
+
+        power_signal = np.mean(signal ** 2)  # 信号功率
+        power_noise = np.mean(noise ** 2)  # 噪声功率
+
+        if power_noise == 0:
+            return float('inf'), "信噪比无穷大（无噪声）"
+
+        snr = 10 * np.log10(power_signal / power_noise)  # 计算SNR
+        return snr, None  # 返回SNR值和错误信息
+
+
+    def check_snr(file_path, noise_start=0, noise_end=1000, threshold=15):
         """检查信噪比是否满足要求"""
-        y, sr = librosa.load(file_path, sr=None)
-        signal_power = np.mean(y ** 2)
-        noise_sample = y[:int(0.5 * sr)]
-        noise_power = np.mean(noise_sample ** 2)
+        snr, error = calculate_snr_with_ref(file_path, noise_start, noise_end)
 
-        if noise_power == 0:
-            snr = float("inf")
+        if error:
+            return False, error
+
+        if snr >= threshold:
+            return True, snr
         else:
-            snr = 10 * np.log10(signal_power / noise_power)
-
-        return snr >= threshold, snr  # 返回布尔值和信噪比值
+            return False, snr
 
 
     def load_audio(file_path):
@@ -88,15 +112,6 @@ if app_mode == "音频质检":
         if len(y) == 0:
             raise ValueError("音频数据为空")
         return y, sr
-
-
-    def write_wave(file_path, audio_data, sample_rate):
-        """保存音频为16-bit PCM WAV格式"""
-        with wave.open(file_path, 'wb') as wf:
-            wf.setnchannels(1)  # 单声道
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(sample_rate)
-            wf.writeframes(audio_data)
 
 
     def vad_check(file_path):
@@ -124,7 +139,7 @@ if app_mode == "音频质检":
             if vad.is_speech(frame_bytes, sr):
                 segments.append((start, end))
 
-        return segments  # 返回检测到的语音段落
+        return len(segments) > 0  # 返回是否有语音段落
 
 
     def noise_check(file_path):
@@ -136,37 +151,8 @@ if app_mode == "音频质检":
         return noise_power <= noise_threshold
 
 
-    def initial_check(file_path):
-        """初检阶段：检查音频格式、时长、信噪比"""
-        if not check_audio_format(file_path):
-            return "❌ 不合格 - 格式错误", None
-
-        if not check_audio_duration(file_path):
-            return "❌ 不合格 - 时长不合理", None
-
-        snr_status, snr_value = check_snr(file_path)
-        if not snr_status:
-            return f"❌ 不合格 - 信噪比过低（{snr_value:.2f} dB）", snr_value
-
-        return "✅ 合格 - 初检通过", snr_value
-
-
-    def review_check(file_path):
-        """复检阶段：语音活动检测和噪声检测"""
-        # 语音活动检测（VAD）
-        segments = vad_check(file_path)
-        if len(segments) < 2:
-            return "❌ 不合格 - 语音连贯性差"
-
-        # 噪声检测
-        if not noise_check(file_path):
-            return "❌ 不合格 - 噪声超标"
-
-        return "✅ 合格 - 复检通过"
-
-
-    # 多轮质检处理
-    def multi_round_check(uploaded_files):
+    # 一轮质检处理
+    def single_round_check(uploaded_files, noise_start=0, noise_end=1000):
         all_results = []  # 用于存储所有质检结果
         for uploaded_file in uploaded_files:
             # 根据质检方式处理文件
@@ -178,19 +164,34 @@ if app_mode == "音频质检":
                     temp_file.write(uploaded_file.read())
                     file_path = temp_file.name
 
-            # 初检
-            initial_status, snr_value = initial_check(file_path)
-            # 复检
-            if initial_status.startswith("✅"):
-                review_status = review_check(file_path)
+            # 格式检查
+            format_status = "✅ 合格" if check_audio_format(file_path) else "❌ 不合格"
+
+            # 时长检查
+            duration_status, duration_value = check_audio_duration(file_path)
+            duration_status = "✅ 合格" if duration_status else "❌ 不合格"
+
+            # 信噪比检查（基于预留噪声段）
+            snr_status, snr_value = check_snr(file_path, noise_start, noise_end, snr_threshold)
+            if isinstance(snr_value, str):
+                snr_status = "❌ 不合格"
             else:
-                review_status = "未进行复检"
+                snr_status = "✅ 合格" if snr_status else "❌ 不合格"
+
+            # 语音活动检测
+            vad_status = "✅ 合格" if vad_check(file_path) else "❌ 不合格"
+
+            # 噪声检测
+            noise_status = "✅ 合格" if noise_check(file_path) else "❌ 不合格"
 
             all_results.append({
                 "文件名": os.path.basename(file_path),
-                "初检结果": initial_status,
-                "复检结果": review_status,
-                "信噪比 (dB)": snr_value if snr_value is not None else "N/A",
+                "格式检查": format_status,
+                "时长检查": f"{duration_status} ({duration_value:.2f}秒)",
+                "信噪比检查": f"{snr_status} ({snr_value} dB)" if isinstance(snr_value, (
+                int, float)) else f"{snr_status} ({snr_value})",
+                "语音活动检测": vad_status,
+                "噪声检测": noise_status,
                 "播放": file_path  # 添加播放音频的路径
             })
 
@@ -199,7 +200,7 @@ if app_mode == "音频质检":
 
     # 执行质检
     if uploaded_files:
-        final_results = multi_round_check(uploaded_files)
+        final_results = single_round_check(uploaded_files, noise_start, noise_end)
 
         # 显示质检结果
         st.write("🔎 **质检结果**")
@@ -223,7 +224,6 @@ if app_mode == "音频质检":
         session_state = st.session_state
         session_state.qc_results = results_df
 
-
 # 文本标注板块
 if app_mode == "文本标注":
     st.header("📝 文本标注")
@@ -233,7 +233,7 @@ if app_mode == "文本标注":
         st.error("请先进行音频质检，然后才能进行文本标注")
     else:
         qc_results = st.session_state.qc_results
-        qualified_files = qc_results[qc_results['复检结果'] == '✅ 合格 - 复检通过']
+        qualified_files = qc_results[qc_results['格式检查'] == '✅ 合格']
 
         # 上传 Excel 文件
         uploaded_excel = st.file_uploader("📂 请选择包含文本内容的 Excel 文件", type=["xlsx", "xls"])
@@ -270,9 +270,11 @@ if app_mode == "文本标注":
                     # 显示文本标注输入框
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.text_area("原始文本（不可编辑）", original_text, height=100, disabled=True, key=f"original_{file_name}")
+                        st.text_area("原始文本（不可编辑）", original_text, height=100, disabled=True,
+                                     key=f"original_{file_name}")
                     with col2:
-                        modified_text = st.text_area("修改文本（可编辑）", original_text, height=100, key=f"modified_{file_name}")
+                        modified_text = st.text_area("修改文本（可编辑）", original_text, height=100,
+                                                     key=f"modified_{file_name}")
 
                     # 合格/不合格按钮
                     col3, col4 = st.columns(2)
